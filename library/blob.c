@@ -50,6 +50,7 @@
 #include <unistd.h>
 
 #include "measure_points.h"
+#include "original_id_helpers.h"
 
 #define DIFF(s, e) ((e).tv_sec - (s).tv_sec) * 1000000 + ((e).tv_usec - (s).tv_usec)
 
@@ -624,6 +625,14 @@ static int eblob_fill_range_offsets(struct eblob_base_ctl *bctl, struct eblob_it
 static int eblob_key_range_compare(const void *k, const void *r) {
 	const struct eblob_key *key = k;
 	const struct eblob_index_block *range = r;
+
+	// #### BEGIN: passthrought_original_id modifications ####
+	// reorder ids in key
+	struct eblob_key key_reord;
+	original_id_reorder(&key_reord, key);
+	key = &key_reord;
+	// #### END: passthrought_original_id modifications ####
+
 	if (eblob_id_cmp(key->id, range->start_key.id) < 0)
 		return -1;
 	if (eblob_id_cmp(key->id, range->end_key.id) > 0)
