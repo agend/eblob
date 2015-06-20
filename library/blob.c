@@ -626,13 +626,6 @@ static int eblob_key_range_compare(const void *k, const void *r) {
 	const struct eblob_key *key = k;
 	const struct eblob_index_block *range = r;
 
-	// #### BEGIN: passthrought_original_id modifications ####
-	// reorder ids in key
-	struct eblob_key key_reord;
-	original_id_reorder(&key_reord, key);
-	key = &key_reord;
-	// #### END: passthrought_original_id modifications ####
-
 	if (eblob_id_cmp(key->id, range->start_key.id) < 0)
 		return -1;
 	if (eblob_id_cmp(key->id, range->end_key.id) > 0)
@@ -668,7 +661,7 @@ static int eblob_local_ranges_check(struct eblob_iterate_control *ctl, int curre
 	for (i = loc->pos; i < loc->num; ++i) {
 		struct eblob_disk_control *dc = &loc->dc[i];
 		/* search range that holds the key by bsearch. If there is no such range then skip the key */
-		if (bsearch(&dc->key, bases, bases_num, sizeof(struct eblob_index_block), eblob_key_range_compare) != NULL) {
+		if (bsearch(&dc->key, bases, bases_num, sizeof(struct eblob_index_block), eblob_key_range_compare_original_id_mod) != NULL) {
 			out[out_pos++] = *dc;
 		}
 	}

@@ -90,13 +90,6 @@ static int eblob_key_range_cmp(const void *k1, const void *k2)
 	const struct eblob_index_block *index = k2;
 	int cmp;
 
-	// #### BEGIN: passthrought_original_id modifications ####
-	// reorder ids in key
-	struct eblob_key key_reord;
-	original_id_reorder(&key_reord, key);
-	key = &key_reord;
-	// #### END: passthrought_original_id modifications ####
-
 	/* compare key against start of the [start_key, end_key] range */
 	cmp = eblob_id_cmp(key->id, index->start_key.id);
 
