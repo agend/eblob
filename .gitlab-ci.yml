@@ -1,0 +1,51 @@
+centos6:
+  script:
+  - mkdir deps
+  - "# patching"
+  - wget http://gitlab.loc/snippets/14/raw -O ./deps/eblob.patch
+  - dos2unix ./deps/eblob.patch
+  - "# add new line to the end of file"
+  - "# sed -i -e '$a\\' ./deps/eblob.patch"
+  - git apply ./deps/eblob.patch
+  - ''
+  - scp -r distro@gitlab.loc:~/elliptics/deps/el6/*.rpm ./deps/
+  - yum localinstall -y ./deps/*
+  - cur_dir_name=${PWD##*/}
+  - mkdir -p ./rpmbuild/{SOURCES,BUILD,RPMS,SPECS,SRPMS}
+  - mkdir -p ./rpmbuild/RPMS/x86-64
+  - VERSION=`grep Version eblob-bf.spec | awk -F "\t" '{print $2}'`
+  - tar cjf ./rpmbuild/SOURCES/eblob-${VERSION}.tar.bz2 ../${cur_dir_name} --exclude=rpmbuild
+    --transform s/${cur_dir_name}/eblob-${VERSION}/
+  - rpmbuild -ba --define "_topdir ${PWD}/rpmbuild" eblob-bf.spec
+  - scp ./rpmbuild/RPMS/x86_64/* distro@gitlab.loc:~/elliptics/el6/
+  tags:
+  - centos6
+  except:
+  - tags
+  - master
+centos7:
+  script:
+  - mkdir deps
+  - ''
+  - "# patching"
+  - wget http://gitlab.loc/snippets/14/raw -O ./deps/eblob.patch
+  - dos2unix ./deps/eblob.patch
+  - "# add new line to the end of file"
+  - "# sed -i -e '$a\\' ./deps/eblob.patch"
+  - git apply ./deps/eblob.patch
+  - ''
+  - scp -r distro@gitlab.loc:~/elliptics/deps/el7/*.rpm ./deps/
+  - yum localinstall -y ./deps/*
+  - cur_dir_name=${PWD##*/}
+  - mkdir -p ./rpmbuild/{SOURCES,BUILD,RPMS,SPECS,SRPMS}
+  - mkdir -p ./rpmbuild/RPMS/x86-64
+  - VERSION=`grep Version eblob-bf.spec | awk -F "\t" '{print $2}'`
+  - tar cjf ./rpmbuild/SOURCES/eblob-${VERSION}.tar.bz2 ../${cur_dir_name} --exclude=rpmbuild
+    --transform s/${cur_dir_name}/eblob-${VERSION}/
+  - rpmbuild -ba --define "_topdir ${PWD}/rpmbuild" eblob-bf.spec
+  - scp ./rpmbuild/RPMS/x86_64/* distro@gitlab.loc:~/elliptics/el7/
+  tags:
+  - centos7
+  except:
+  - tags
+  - master
