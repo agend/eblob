@@ -86,7 +86,7 @@ enum eblob_log_levels {
 	EBLOB_LOG_INFO,
 	EBLOB_LOG_NOTICE,
 	EBLOB_LOG_DEBUG,
-	EBLOB_LOG_SPAM,
+	EBLOB_LOG_SPAM = EBLOB_LOG_DEBUG,
 };
 
 struct eblob_log {
@@ -184,6 +184,15 @@ enum eblob_read_flavour {
 };
 
 #define BLOB_DISK_CTL_REMOVE		(1<<0)
+/*
+ * This flag is set for records that are written with unfilled footer,
+ * so its' footer should not be used for data verification.
+ * This flag doesn't mean that footer is missed or not,
+ * it should only be used for unconditional disabling of data verification.
+ *
+ * NB! If eblob is configure with EBLOB_NO_FOOTER, all records will be written without any footer,
+ * so eblob will skip data verification.
+ */
 #define BLOB_DISK_CTL_NOCSUM		(1<<1)
 #define BLOB_DISK_CTL_COMPRESS		(1<<2) /* DEPRECATED */
 #define BLOB_DISK_CTL_WRITE_RETURN	(1<<3) /* DEPRECATED */
@@ -202,7 +211,13 @@ enum eblob_read_flavour {
 #define BLOB_DISK_CTL_UNCOMMITTED	(1<<7)
 
 /*
- * This flags is set for records that were checksummed by chunks
+ * This flag is set for records that have footers purposed to contain chunked checksum.
+ * Records without this flag will be considered as those
+ * whose footers are purposed to contain sha512 checksum.
+ * This flag does not mean that record's footer is filled or unfilled.
+ *
+ * NB! If eblob is configure with EBLOB_NO_FOOTER, all records will be written without any footer,
+ * so eblob will skip data verification.
  */
 #define BLOB_DISK_CTL_CHUNKED_CSUM	(1<<8)
 
@@ -218,8 +233,9 @@ struct eblob_disk_control {
 	 */
 	uint64_t		data_size;
 
-	/* total size this record occupies on disk.
+	/* total size this record occupies in the blob file.
 	 * It includes alignment and header/footer sizes.
+	 * It doesn't include size of this record's header in the index file.
 	 * This structure is header.
 	 */
 	uint64_t		disk_size;
@@ -382,11 +398,28 @@ struct eblob_config {
 	 */
 	uint32_t	stat_id;
 
+	/*
+	 * Directory, where chunks will be stored during datasort.
+	 * Blob is being split into smaller chunks during datasort,
+	 * every chunk is sorted by key and finally all chunks merged into
+	 * single sorted blob. This heavily affects IO performance of the backend.
+	 *
+	 * If chunks_dir is specified, then chunks will be stored and sorted in this directory.
+	 * This moves major set of IO operations into specified directory, it is recommended to
+	 * put it on a different drive, thus reducing IO influence to client's operations.
+	 *
+	 * Comparison of defragmentation on dedicated device vs backend's device (per key):
+	 * a) dedicated device: 1 read and 1 write at the backend's device and 3 read and
+	 * 3 write at the dedicated device.
+	 * b) backend's device: 3 read, 3 write and 1 move at the backend's device.
+	 */
+	char			*chunks_dir;
+
 	/* for future use */
 	uint64_t		__pad_64[8];
 	int			__pad_int[5];
 	char			__pad_char[8];
-	void			*__pad_voidp[8];
+	void			*__pad_voidp[7];
 };
 
 /*
@@ -431,10 +464,11 @@ struct eblob_iterate_callbacks {
 #define EBLOB_ITERATE_FLAGS_ALL			(1<<0)	/* iterate over all blobs, not only the last one */
 #define EBLOB_ITERATE_FLAGS_READONLY		(1<<1)	/* do not modify entries while iterating a blob */
 #define EBLOB_ITERATE_FLAGS_INITIAL_LOAD	(1<<2)	/* set on initial load */
+#define EBLOB_ITERATE_FLAGS_VERIFY_CHECKSUM	(1<<3)	/* verify checksum for entries while iterating a blob */
 
 /**
  * Structure which controls which keys should be iterated over.
- * [start, stop] keys are inclusive. 
+ * [start, stop] keys are inclusive.
  */
 
 struct eblob_index_block {
@@ -684,9 +718,11 @@ enum eblob_stat_local_flavour {
 	EBLOB_LST_MIN,
 	EBLOB_LST_RECORDS_TOTAL,
 	EBLOB_LST_RECORDS_REMOVED,
-	EBLOB_LST_REMOVED_SIZE,
+	EBLOB_LST_REMOVED_SIZE,		/* total size occupied by all removed records
+					 * in all blobs and index files
+					 */
 	EBLOB_LST_INDEX_CORRUPTED_ENTRIES,
-	EBLOB_LST_BASE_SIZE,
+	EBLOB_LST_BASE_SIZE,		/* total size of all blobs and index files */
 	EBLOB_LST_BLOOM_SIZE,
 	EBLOB_LST_INDEX_BLOCKS_SIZE,
 	EBLOB_LST_WANT_DEFRAG,

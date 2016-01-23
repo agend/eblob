@@ -93,6 +93,16 @@ static int datasort_base_get_path(struct eblob_backend *b, struct eblob_base_ctl
 	return 0;
 }
 
+static int datasort_chunk_get_path(struct eblob_backend *b, struct eblob_base_ctl *bctl,
+		char *path, unsigned int path_max)
+{
+	if (b == NULL || bctl == NULL || path == NULL || b->cfg.chunks_dir == NULL)
+		return -EINVAL;
+
+	snprintf(path, path_max, "%s/chunks-%u-0.%d", b->cfg.chunks_dir, b->cfg.stat_id, bctl->index);
+	return 0;
+}
+
 /**
  * datasort_force_sort() - kick in defragmentation.
  */
@@ -171,7 +181,7 @@ uint64_t datasort_next_defrag(const struct eblob_backend *b)
 	next_defrag = EBLOB_MIN(timed_defrag, sched_defrag);
 	next_defrag = EBLOB_MAX(next_defrag, EBLOB_DEFAULT_DEFRAG_MIN_TIMEOUT);
 	EBLOB_WARNX(b->cfg.log, EBLOB_LOG_INFO,
-			"defrag: next datasort is sheduled to +%" PRIu64 " seconds.",
+			"defrag: next datasort is scheduled to +%" PRIu64 " seconds.",
 			next_defrag);
 
 	return next_defrag;
@@ -199,9 +209,9 @@ int datasort_base_is_sorted(struct eblob_base_ctl *bctl)
 	b = bctl->back;
 
 	/* Check in memory */
-	if (bctl->sorted == 1)
+	if (bctl->data_ctl.sorted == 1)
 		return 1;
-	else if (bctl->sorted == -1)
+	else if (bctl->data_ctl.sorted == -1)
 		return 0;
 
 	/* Check filesystem */
@@ -215,12 +225,12 @@ int datasort_base_is_sorted(struct eblob_base_ctl *bctl)
 	if (stat(mark, &st) == -1) {
 		EBLOB_WARNC(b->cfg.log, EBLOB_LOG_INFO, errno,
 				"mark not found: %s, assuming unsorted data", mark);
-		bctl->sorted = -1;
+		bctl->data_ctl.sorted = -1;
 		return 0;
 	}
 	EBLOB_WARNX(b->cfg.log, EBLOB_LOG_INFO,
 			"mark is found: %s, assuming sorted data", mark);
-	bctl->sorted = 1;
+	bctl->data_ctl.sorted = 1;
 	return 1;
 }
 
@@ -282,7 +292,7 @@ err_rmdir:
 /*
  * Create temp directory for sorting
  */
-static char *datasort_mkdtemp(struct datasort_cfg *dcfg)
+static char *datasort_mkdtemp(struct datasort_cfg *dcfg, int for_chunks)
 {
 	char *path, *tmppath;
 	static const char tpl_suffix[] = ".datasort.XXXXXX";
@@ -293,9 +303,16 @@ static char *datasort_mkdtemp(struct datasort_cfg *dcfg)
 		goto err;
 	}
 
-	if (datasort_base_get_path(dcfg->b, dcfg->bctl[0], path, PATH_MAX) != 0) {
-		EBLOB_WARNX(dcfg->log, EBLOB_LOG_ERROR, "defrag: datasort_base_get_path");
-		goto err_free_path;
+	if (for_chunks) {
+		if (datasort_chunk_get_path(dcfg->b, dcfg->bctl[0], path, PATH_MAX) != 0) {
+			EBLOB_WARNX(dcfg->log, EBLOB_LOG_ERROR, "defrag: datasort_chunk_get_path");
+			goto err_free_path;
+		}
+	} else {
+		if (datasort_base_get_path(dcfg->b, dcfg->bctl[0], path, PATH_MAX) != 0) {
+			EBLOB_WARNX(dcfg->log, EBLOB_LOG_ERROR, "defrag: datasort_base_get_path");
+			goto err_free_path;
+		}
 	}
 
 	tmppath = mkdtemp(strcat(path, tpl_suffix));
@@ -315,7 +332,7 @@ err:
 /*
  * Creates new chunk on disk
  */
-static struct datasort_chunk *datasort_add_chunk(struct datasort_cfg *dcfg)
+static struct datasort_chunk *datasort_add_chunk(struct datasort_cfg *dcfg, const char *dir)
 {
 	int fd;
 	char *path;
@@ -323,7 +340,7 @@ static struct datasort_chunk *datasort_add_chunk(struct datasort_cfg *dcfg)
 	static const char tpl_suffix[] = "chunk.XXXXXX";
 
 	assert(dcfg);
-	assert(dcfg->dir);
+	assert(dir);
 
 	path = malloc(PATH_MAX);
 	if (path == NULL) {
@@ -331,7 +348,7 @@ static struct datasort_chunk *datasort_add_chunk(struct datasort_cfg *dcfg)
 		goto err;
 	}
 
-	snprintf(path, PATH_MAX, "%s/%s", dcfg->dir, tpl_suffix);
+	snprintf(path, PATH_MAX, "%s/%s", dir, tpl_suffix);
 	fd = mkstemp(path);
 	if (fd == -1) {
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: mkstemp: %s", path);
@@ -453,7 +470,7 @@ static int datasort_split_iterator(struct eblob_disk_control *dc,
 	if (c == NULL || (dcfg->chunk_size > 0 && c->offset + dc->disk_size >= dcfg->chunk_size)
 			|| (dcfg->chunk_limit > 0 && c->count >= dcfg->chunk_limit)) {
 		/* TODO: here we can plug sort for speedup */
-		c = datasort_add_chunk(dcfg);
+		c = datasort_add_chunk(dcfg, dcfg->chunks_dir);
 		if (c == NULL) {
 			err = -EIO;
 			EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err, "defrag: datasort_add_chunk: FAILED");
@@ -664,7 +681,7 @@ static struct datasort_chunk *datasort_sort_chunk(struct datasort_cfg *dcfg,
 			unsorted_chunk->fd, unsorted_chunk->count, unsorted_chunk->offset);
 
 	/* Create new sorted chunk */
-	sorted_chunk = datasort_add_chunk(dcfg);
+	sorted_chunk = datasort_add_chunk(dcfg, dcfg->chunks_dir);
 	if (sorted_chunk == NULL) {
 		EBLOB_WARNX(dcfg->log, EBLOB_LOG_ERROR, "defrag: datasort_add_chunk: FAILED");
 		goto err;
@@ -844,7 +861,7 @@ static struct datasort_chunk *datasort_merge(struct datasort_cfg *dcfg)
 	EBLOB_WARNX(dcfg->log, EBLOB_LOG_INFO, "defrag: merge: start");
 
 	/* Create resulting chunk */
-	merged_chunk = datasort_add_chunk(dcfg);
+	merged_chunk = datasort_add_chunk(dcfg, dcfg->dir);
 	if (merged_chunk == NULL)
 		goto err;
 
@@ -905,6 +922,7 @@ static void datasort_destroy(struct datasort_cfg *dcfg)
 {
 	pthread_mutex_destroy(&dcfg->lock);
 	free(dcfg->dir);
+	free(dcfg->chunks_dir);
 };
 
 /*!
@@ -979,7 +997,7 @@ err_out_exit:
 static int datasort_swap_memory(struct datasort_cfg *dcfg)
 {
 	struct eblob_base_ctl *sorted_bctl, *unsorted_bctl;
-	struct eblob_map_fd index;
+	struct eblob_file_ctl index;
 	char tmp_index_path[PATH_MAX], data_path[PATH_MAX];
 	uint64_t i, offset;
 	int err, n;
@@ -1017,6 +1035,7 @@ static int datasort_swap_memory(struct datasort_cfg *dcfg)
 	 * FIXME: Copy permissions from original fd
 	 */
 	memset(&index, 0, sizeof(index));
+	index.sorted = 1;
 	index.size = dcfg->result->count * sizeof(struct eblob_disk_control);
 	index.fd = open(tmp_index_path, O_RDWR | O_CLOEXEC | O_TRUNC | O_CREAT, 0644);
 	if (index.fd == -1) {
@@ -1055,19 +1074,18 @@ static int datasort_swap_memory(struct datasort_cfg *dcfg)
 	/*
 	 * Setup sorted base
 	 */
-	sorted_bctl->data_fd = dcfg->result->fd;
-	sorted_bctl->index_fd = index.fd;
-	sorted_bctl->sort = index;
+	sorted_bctl->data_ctl.fd = dcfg->result->fd;
+	sorted_bctl->index_ctl = index;
 
 	/* Setup new base */
 	if ((err = eblob_base_setup_data(sorted_bctl, 1)) != 0) {
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err, "defrag: eblob_base_setup_data: FAILED");
 		goto err_free_base;
 	}
-	assert(sorted_bctl->data_size == dcfg->result->offset);
-	assert(sorted_bctl->index_size == index.size);
+	assert(sorted_bctl->data_ctl.size == dcfg->result->offset);
+	assert(sorted_bctl->index_ctl.size == index.size);
 
-	sorted_bctl->data_offset = sorted_bctl->data_size;
+	sorted_bctl->data_ctl.offset = sorted_bctl->data_ctl.size;
 
 	/* Populate sorted index blocks */
 	if ((err = eblob_index_blocks_fill(sorted_bctl)) != 0) {
@@ -1107,7 +1125,7 @@ static int datasort_swap_memory(struct datasort_cfg *dcfg)
 
 	/* Account for new size */
 	eblob_stat_set(sorted_bctl->stat, EBLOB_LST_BASE_SIZE,
-			sorted_bctl->index_size + sorted_bctl->data_size);
+			sorted_bctl->index_ctl.size + sorted_bctl->data_ctl.size);
 	eblob_stat_set(sorted_bctl->stat, EBLOB_LST_RECORDS_TOTAL, dcfg->result->count);
 
 	/*
@@ -1143,7 +1161,7 @@ err:
 static int datasort_swap_disk(struct datasort_cfg *dcfg)
 {
 	struct eblob_base_ctl *sorted_bctl, *unsorted_bctl;
-	char tmp_index_path[PATH_MAX], index_path[PATH_MAX];
+	char tmp_index_path[PATH_MAX];
 	char sorted_index_path[PATH_MAX], data_path[PATH_MAX];
 	char mark_path[PATH_MAX];
 	int err, n;
@@ -1168,8 +1186,7 @@ static int datasort_swap_disk(struct datasort_cfg *dcfg)
 			dcfg->result->path, data_path);
 
 	snprintf(mark_path, PATH_MAX, "%s" EBLOB_DATASORT_SORTED_MARK_SUFFIX, data_path);
-	snprintf(index_path, PATH_MAX, "%s.index", data_path);
-	snprintf(sorted_index_path, PATH_MAX, "%s.sorted", index_path);
+	snprintf(sorted_index_path, PATH_MAX, "%s.index.sorted", data_path);
 	snprintf(tmp_index_path, PATH_MAX, "%s.tmp", sorted_index_path);
 
 	/*
@@ -1202,12 +1219,7 @@ static int datasort_swap_disk(struct datasort_cfg *dcfg)
 				dcfg->result->path, data_path);
 	if (rename(tmp_index_path, sorted_index_path) == -1)
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: rename: %s -> %s",
-				tmp_index_path, index_path);
-
-	/* Hardlink sorted index to unsorted one */
-	if (link(sorted_index_path, index_path) == -1)
-		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: link: %s -> %s",
-				sorted_index_path, index_path);
+				tmp_index_path, sorted_index_path);
 
 	/* Leave mark that data file is sorted */
 	if ((err = open(mark_path, O_TRUNC | O_CREAT | O_CLOEXEC, 0644)) != -1) {
@@ -1221,9 +1233,9 @@ static int datasort_swap_disk(struct datasort_cfg *dcfg)
 			"defrag: swapped: data: %s -> %s, "
 			"data_fd: %d -> %d, index_fd: %d -> %d",
 			dcfg->result->path, data_path,
-			sorted_bctl->data_fd, unsorted_bctl->data_fd,
-			eblob_get_index_fd(sorted_bctl),
-			eblob_get_index_fd(unsorted_bctl));
+			sorted_bctl->data_ctl.fd, unsorted_bctl->data_ctl.fd,
+			sorted_bctl->index_ctl.fd,
+			unsorted_bctl->index_ctl.fd);
 	return 0;
 
 err:
@@ -1246,14 +1258,14 @@ static void datasort_cleanup(struct datasort_cfg *dcfg)
 		/* Sanity */
 		assert(bctl != NULL);
 
-		err = eblob_pagecache_hint(bctl->data_fd, EBLOB_FLAGS_HINT_DONTNEED);
+		err = eblob_pagecache_hint(bctl->data_ctl.fd, EBLOB_FLAGS_HINT_DONTNEED);
 		if (err)
 			EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err,
-					"defrag: eblob_pagecache_hint: data: %d", bctl->data_fd);
-		err = eblob_pagecache_hint(bctl->index_fd, EBLOB_FLAGS_HINT_DONTNEED);
+					"defrag: eblob_pagecache_hint: data: %d", bctl->data_ctl.fd);
+		err = eblob_pagecache_hint(bctl->index_ctl.fd, EBLOB_FLAGS_HINT_DONTNEED);
 		if (err)
 			EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err,
-					"defrag: eblob_pagecache_hint: index: %d", bctl->index_fd);
+					"defrag: eblob_pagecache_hint: index: %d", bctl->index_ctl.fd);
 
 		/*
 		 * Cleanup unsorted base
@@ -1266,9 +1278,13 @@ static void datasort_cleanup(struct datasort_cfg *dcfg)
 					"defrag: _eblob_base_ctl_cleanup: FAILED");
 	}
 
-	/* Remove temporary directory */
+	/* Remove temporary directories */
 	if (rmdir(dcfg->dir) == -1)
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: rmdir: %s", dcfg->dir);
+
+	if (strcmp(dcfg->chunks_dir, dcfg->dir) &&
+	    rmdir(dcfg->chunks_dir) == -1)
+		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: rmdir: %s", dcfg->chunks_dir);
 
 	/* Free resulting chunk and dcfg */
 	_datasort_destroy_chunk(dcfg->result);
@@ -1326,7 +1342,7 @@ int eblob_generate_sorted_data(struct datasort_cfg *dcfg)
 
 	/* Soon we'll be using it */
 	for (n = 0; n < dcfg->bctl_cnt; ++n) {
-		err = eblob_pagecache_hint(dcfg->bctl[n]->data_fd, EBLOB_FLAGS_HINT_WILLNEED);
+		err = eblob_pagecache_hint(dcfg->bctl[n]->data_ctl.fd, EBLOB_FLAGS_HINT_WILLNEED);
 		if (err)
 			EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err, "defrag: eblob_pagecache_hint: %s",
 					dcfg->bctl[n]->name);
@@ -1350,11 +1366,27 @@ int eblob_generate_sorted_data(struct datasort_cfg *dcfg)
 	pthread_mutex_unlock(&dcfg->b->lock);
 
 	/* Create tmp directory */
-	dcfg->dir = datasort_mkdtemp(dcfg);
+	dcfg->dir = datasort_mkdtemp(dcfg, 0);
 	if (dcfg->dir == NULL) {
 		err = -EIO;
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err, "defrag: datasort_mkdtemp");
 		goto err_stop;
+	}
+
+	if (dcfg->b->cfg.chunks_dir != NULL) {
+		/* Create tmp directory for chunks */
+		dcfg->chunks_dir = datasort_mkdtemp(dcfg, 1);
+		if (dcfg->chunks_dir == NULL) {
+			err = -EIO;
+			EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, -err, "defrag: datasort_mkdtemp for chunks");
+			goto err_rmdir;
+		}
+	} else {
+		dcfg->chunks_dir = strdup(dcfg->dir);
+		if (!dcfg->chunks_dir) {
+			err = -ENOMEM;
+			goto err_rmdir;
+		}
 	}
 
 	/*
@@ -1437,7 +1469,7 @@ int eblob_generate_sorted_data(struct datasort_cfg *dcfg)
 	datasort_cleanup(dcfg);
 
 	/* Mark base as sorted */
-	dcfg->sorted_bctl->sorted = 1;
+	dcfg->sorted_bctl->data_ctl.sorted = 1;
 
 	/* Increase defrag_generation in order to interrupted operation could relookup keys.
 	 */
@@ -1459,6 +1491,8 @@ err_unlock_bctl:
 err_rmdir:
 	if (rmdir(dcfg->dir) == -1)
 		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: rmdir: %s", dcfg->dir);
+	if (dcfg->chunks_dir && rmdir(dcfg->chunks_dir) == -1)
+		EBLOB_WARNC(dcfg->log, EBLOB_LOG_ERROR, errno, "defrag: rmdir: %s", dcfg->chunks_dir);
 err_stop:
 	for (n = 0; n < dcfg->bctl_cnt; ++n)
 		if (eblob_binlog_stop(&dcfg->bctl[n]->binlog) != 0)

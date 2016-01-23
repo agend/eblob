@@ -28,6 +28,20 @@
 extern "C" {
 #endif
 
+#define EBLOB_CSUM_CHUNK_SIZE	(1UL<<20)
+
+/*
+ * eblob_disk_footer contains csum of data.
+ * @csum - sha512 of record's data.
+ *
+ * eblob_disk_footer are kept at the end of the recods.
+ */
+struct eblob_disk_footer {
+	unsigned char	csum[EBLOB_ID_SIZE];
+	uint64_t	offset;
+} __attribute__ ((packed));
+
+
 /*
  * eblob_calculate_footer_size() - computes and returns size of footer for any data with @data_size
  *
@@ -36,6 +50,8 @@ extern "C" {
  * NB! If eblob is configured with EBLOB_NO_FOOTER flag or @data_size is 0, return value will be 0.
  */
 uint64_t eblob_calculate_footer_size(struct eblob_backend *b, uint64_t data_size);
+
+uint64_t eblob_get_footer_size(const struct eblob_backend *b, const struct eblob_write_control *wc);
 
 /*
  * eblob_commit_footer() - computes and writes footer for @key pointed by @wc

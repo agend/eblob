@@ -1,7 +1,7 @@
 Summary:	low-level IO library which stores data in huge blob files appending records one after another
 Name:		eblob
-Version:	0.23.3
-Release:	1.oid_mod%{?dist}
+Version:	0.23.12
+Release:	1.oid_mod%{?dist}.1
 
 License:	GPLv2+
 Group:		System Environment/Libraries
@@ -108,6 +108,67 @@ rm -rf %{buildroot}
 %{_libdir}/lib*.so
 
 %changelog
+* Wed Jan 06 2016 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.12
+- merge: fixed tool to use sorted index if unsorted is not available
+- blob: added eblob_dump_dc() function which prints disk control structure into provided buffer
+- check: use loud comparison function when checking for index/data headers mismatch
+- check: if there is no no-checksum bit, there must be enough space in the footer for checksum
+- footer: move common definitions into header
+- index: added sorted blob sanity check which verifies whether keys are sorted in ascending order
+- index: extended iterator/bloom filter filling debug
+- log: set eblob spam log level to debug, otherwise there is no way it can be ever set
+
+* Thu Dec 10 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.11
+- iterate: verify checksum for entries while iterating a blob
+
+* Fri Nov 13 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.10
+- fixed failing eblob_remove with -9 error
+-  	`eblob_remove` should hold bctl that stores the key to protect bctl from defragmentation
+- 	until it updates record's on-disk headers.
+- fixed failing _eblob_read_ll with -9 error
+- 	`eblob_fill_write_control_from_ram` should only be called when b->lock is locked by a caller thread
+- checksums: fixed checksumming empty data
+
+* Wed Nov 11 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.9
+- fixed dropping `BLOB_DISK_CTL_UNCOMMITTED` in `eblob_plain_writev_prepare`
+- Added check to `eblob_fill_write_control_from_ram`
+- 	Now it reads headers from index and data files and if they are differ fails with -EINVAL error.
+- datasort: properly use cfg->stat_id as backend_id in chunks directory name
+- logs: fixed filename at 'unlink index:' message
+- logs: added logs when checkum verification is failed because of incorrect sizes at header
+
+* Wed Nov 04 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.8
+- bctl: when removing just created base, remove its index too
+- bctl: base can have zero-sized index when it is just created, it is forbidden to have it when we open existing base
+
+* Wed Nov 04 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.7
+- blob: total_size being equal to total_data_size+sizeof(struct eblob_disk_control) is perfectly valid
+- blob: blob setup has to fail if index file is invalid
+- Added check to `write_commit` and `plain_write` that updating object is uncommitted
+
+* Thu Oct 29 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.6
+- prepare: prepare must fix on-disk and in-memory flags, if it is going to reuse existing key
+- remove .index files after index sort
+- defrag: eblob_want_defrag() should not long-lock the whole blob
+- quigon build fix: don't use /dev/stdout from forked processes
+
+* Fri Sep 18 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.5
+- build: fixed build: removed useless scope resolution
+- blob: added removing `BLOB_DISK_CTL_UNCOMMITTED` from record's flags in `eblob_write_commit_prepare`
+- small fix: prevent potential double close in eblob_base_ctl_open()
+- datasort: use optional 'datasort_dir' for creating tmp directory for chunks
+- doc: put extra comments on BLOB_DISK_CTL_NOCSUM and BLOB_DISK_CTL_CHUNKED_CSUM flags
+- plain write: fixed bug with incorrect footer size computing
+- make test: run tests/run_tests.sh
+- fixed extra pointer referencing in eblob_plain_writev_prepare: used &wc in eblob_dump_wc()
+
+* Tue Sep 08 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.4
+- stat: update total/removed records in realtime
+- validate wc flags before binlog check
+- tests: added crypto test of some crypto library functions: sha512_file(), sha512_file_ctx(), sha512_buffer()
+- plain write: use disk_size instead of wc->total_data_size as prepare_disk_size param on defrag (-7 bugfix)
+- crypto: fixed invalid processing of data block larger than buffer in sha512_file()/sha512_file_ctx()
+
 * Thu Aug 20 2015 Evgeniy Polyakov <zbr@ioremap.net> - 0.23.3
 - fixed writing of wc with flags==0 in plain_write() during defrag after blob close
 

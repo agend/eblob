@@ -258,21 +258,6 @@ err_out_exit:
 }
 
 /**
- * eblob_get_index_fd() - Helper function that returns either sort.fd or
- * index_fd from bctl depending on what's available
- *
- * This function is only useful for old(unsorted) blobs that have different
- * index_fd and sort.fd
- */
-int eblob_get_index_fd(struct eblob_base_ctl *bctl)
-{
-	if (bctl == NULL)
-		return -EINVAL;
-
-	return bctl->sort.fd >= 0 ? bctl->sort.fd : bctl->index_fd;
-}
-
-/**
  * eblob_base_wait_locked() - wait until number of bctl users inside critical
  * region reaches zero.
  * NB! To avoid race conditions bctl remains locked.
@@ -331,10 +316,12 @@ inline static uint64_t eblob_validate_ctl_flags(struct eblob_backend *b, uint64_
 	if (b->cfg.blob_flags & EBLOB_NO_FOOTER)
 		flags |= BLOB_DISK_CTL_NOCSUM;
 
-	if (!(flags & BLOB_DISK_CTL_NOCSUM))
-		flags |= BLOB_DISK_CTL_CHUNKED_CSUM;
-	else
-		flags &= ~BLOB_DISK_CTL_CHUNKED_CSUM;
+	/*
+	 * We have to add BLOB_DISK_CTL_CHUNKED_CSUM because it shows
+	 * that footer was prepared with specific size, even if the record
+	 * has BLOB_DISK_CTL_NOCSUM flag.
+	 */
+	flags |= BLOB_DISK_CTL_CHUNKED_CSUM;
 
 	return flags;
 }
@@ -379,7 +366,7 @@ static int eblob_writev_raw(struct eblob_key *key, struct eblob_write_control *w
 		EBLOB_WARNX(wc->bctl->back->cfg.log, EBLOB_LOG_DEBUG, "%s: writev: fd: %d"
 				", iov_size: %" PRIu64 ", iov_offset: %" PRIu64
 				", offset: %" PRIu64, eblob_dump_id(key->id),
-				wc->bctl->data_fd, tmp->size, tmp->offset, offset);
+				wc->bctl->data_ctl.fd, tmp->size, tmp->offset, offset);
 
 		/* Sanity - do not write outside of the record */
 		if (offset + tmp->size > offset_max || offset < offset_min) {
@@ -387,13 +374,112 @@ static int eblob_writev_raw(struct eblob_key *key, struct eblob_write_control *w
 			goto err_exit;
 		}
 
-		err = __eblob_write_ll(wc->bctl->data_fd, tmp->base, tmp->size, offset);
+		err = __eblob_write_ll(wc->bctl->data_ctl.fd, tmp->base, tmp->size, offset);
 		if (err != 0)
 			goto err_exit;
 	}
 
 err_exit:
 	return err;
+}
+
+char *eblob_dump_dc(const struct eblob_disk_control *dc, char *buffer, size_t size)
+{
+	char key_str[2 * EBLOB_ID_SIZE + 1];
+
+	eblob_dump_id_len_raw(dc->key.id, EBLOB_ID_SIZE, key_str);
+
+	snprintf(buffer, size, "key: %s, position: %llu, data size: %llu, disk size: %llu, flags: %s",
+		key_str,
+		(unsigned long long)dc->position,
+		(unsigned long long)dc->data_size, (unsigned long long)dc->disk_size,
+		eblob_dump_dctl_flags(dc->flags));
+
+	return buffer;
+}
+
+/**
+ * eblob_dump_wc_raw() - pretty-print write control structure
+ */
+static void eblob_dump_wc_raw(struct eblob_backend *b, int log_level, struct eblob_key *key, struct eblob_write_control *wc, const char *str, int err) {
+	eblob_log(b->cfg.log, log_level, "blob: %s: i%d: %s: position: %" PRIu64 ", "
+			"offset: %" PRIu64 ", size: %" PRIu64 ", flags: %s, "
+			"total data size: %" PRIu64 ", disk-size: %" PRIu64 ", "
+			"data_fd: %d, index_fd: %d, bctl: %p: %d\n",
+			eblob_dump_id(key->id), wc->index, str, wc->ctl_data_offset,
+			wc->offset, wc->size, eblob_dump_dctl_flags(wc->flags), wc->total_data_size, wc->total_size,
+			wc->data_fd, wc->index_fd, wc->bctl, err);
+}
+
+/**
+ * eblob_dump_wc() - pretty-print write control structure with smart logging level selection
+ */
+static void eblob_dump_wc(struct eblob_backend *b, struct eblob_key *key, struct eblob_write_control *wc, const char *str, int err)
+{
+	int log_level = EBLOB_LOG_NOTICE;
+
+	if (err < 0)
+		log_level = EBLOB_LOG_ERROR;
+
+	eblob_dump_wc_raw(b, log_level, key, wc, str, err);
+}
+
+/**
+ * eblob_rctl_to_wc() - convert ram control to write control
+ */
+static void eblob_rctl_to_wc(const struct eblob_ram_control *rctl, struct eblob_write_control *wc)
+{
+	wc->data_fd = rctl->bctl->data_ctl.fd;
+	wc->index_fd = rctl->bctl->index_ctl.fd;
+
+	wc->index = rctl->bctl->index;
+
+	wc->ctl_index_offset = rctl->index_offset;
+	wc->ctl_data_offset = rctl->data_offset;
+
+	wc->data_offset = wc->ctl_data_offset + sizeof(struct eblob_disk_control) + wc->offset;
+	wc->bctl = rctl->bctl;
+}
+
+/**
+ * eblob_dc_to_wc() - convert disk control control to write control
+ */
+static void eblob_dc_to_wc(const struct eblob_disk_control *dc, struct eblob_write_control *wc)
+{
+	wc->flags = dc->flags;
+	wc->total_size = dc->disk_size;
+	if (dc->data_size < wc->offset + wc->size)
+		wc->total_data_size = wc->offset + wc->size;
+	else
+		wc->total_data_size = dc->data_size;
+
+	if (!wc->size)
+		wc->size = dc->data_size;
+}
+
+/**
+ * Checks whether index and data disk control structures are the same.
+ */
+static int eblob_index_data_mismatch(const struct eblob_base_ctl *bctl,
+		const struct eblob_disk_control *index_dc,
+		const struct eblob_disk_control *data_dc)
+{
+	if (memcmp(data_dc, index_dc, sizeof(struct eblob_disk_control))) {
+		char data_str[512];
+		char index_str[512];
+
+		eblob_log(bctl->back->cfg.log, EBLOB_LOG_ERROR, "blob i%d: eblob_index_data_equal: index/data headers mismatch: "
+			"data header: %s, index header: %s"
+			" you have to remove sorted index and regenerate it from data using `eblob_to_index` tool on '%s'\n",
+			bctl->index,
+			eblob_dump_dc(data_dc, data_str, sizeof(data_str)),
+			eblob_dump_dc(index_dc, index_str, sizeof(index_str)),
+			bctl->name);
+
+		return 1;
+	}
+
+	return 0;
 }
 
 /**
@@ -409,9 +495,8 @@ int eblob_check_record(const struct eblob_base_ctl *bctl,
 	assert(bctl != NULL);
 	assert(bctl->back != NULL);
 
-	const unsigned long long bctl_size = bctl->data_size > (unsigned long long)bctl->data_offset ?
-		bctl->data_size :
-		(unsigned long long)bctl->data_offset;
+	const uint64_t bctl_size = bctl->data_ctl.size > bctl->data_ctl.offset ?
+		bctl->data_ctl.size : bctl->data_ctl.offset;
 
 	/*
 	 * Check record itself
@@ -440,9 +525,33 @@ int eblob_check_record(const struct eblob_base_ctl *bctl,
 	if (dc->position + dc->disk_size > bctl_size) {
 		eblob_log(bctl->back->cfg.log, EBLOB_LOG_ERROR,
 				"blob i%d: %s: malformed entry: position + disk_size is outside of blob: "
-				"pos: %" PRIu64 ", disk_size: %" PRIu64 ", bctl_size: %llu\n",
+				"pos: %" PRIu64 ", disk_size: %" PRIu64 ", bctl_size: %" PRIu64 "\n",
 				bctl->index, eblob_dump_id(dc->key.id), dc->position, dc->disk_size, bctl_size);
 		return -ESPIPE;
+	}
+
+	/*
+	 * If there is no no-checksum bit, there must be enough space in the footer for checksum.
+	 */
+	if (!(dc->flags & BLOB_DISK_CTL_NOCSUM)) {
+		long footer_min_size = sizeof(struct eblob_disk_footer);
+		if (dc->flags & BLOB_DISK_CTL_CHUNKED_CSUM) {
+			footer_min_size = 0;
+
+			if (dc->data_size)
+				footer_min_size = ((dc->data_size - 1) / EBLOB_CSUM_CHUNK_SIZE + 1) * sizeof(uint64_t);
+		}
+
+		if (dc->disk_size < dc->data_size + footer_min_size) {
+			char dc_str[256];
+
+			eblob_log(bctl->back->cfg.log, EBLOB_LOG_ERROR,
+				"blob i%d: malformed entry: disk_size is too small to fit data+checksum "
+				"and there is no no-checksum bit: %s, min-footer-size: %ld\n",
+				bctl->index, eblob_dump_dc(dc, dc_str, sizeof(dc_str)), footer_min_size);
+
+			return -ESPIPE;
+		}
 	}
 
 	return 0;
@@ -462,7 +571,7 @@ static int eblob_check_disk_one(struct eblob_iterate_local *loc)
 	struct eblob_ram_control rc;
 	int err;
 
-	if (bc->data_size == 0)
+	if (bc->data_ctl.size == 0)
 		return -EAGAIN;
 
 	memset(&rc, 0, sizeof(rc));
@@ -490,19 +599,39 @@ static int eblob_check_disk_one(struct eblob_iterate_local *loc)
 	if ((ctl->flags & EBLOB_ITERATE_FLAGS_ALL)
 			&& !(ctl->flags & EBLOB_ITERATE_FLAGS_READONLY)
 			&& !(dc->flags & BLOB_DISK_CTL_REMOVE)) {
-		err = __eblob_read_ll(bc->data_fd, &dc_data, sizeof(struct eblob_disk_control), dc->position);
+		err = __eblob_read_ll(bc->data_ctl.fd, &dc_data, sizeof(struct eblob_disk_control), dc->position);
 		if (err)
 			goto err_out_exit;
 
 		if (dc_data.flags & BLOB_DISK_CTL_REMOVE) {
 			eblob_log(ctl->log, EBLOB_LOG_INFO,
 					"blob: %s: key removed(%s) in blob(%d), but not in index(%d), fixing\n",
-					eblob_dump_id(dc->key.id), eblob_dump_dctl_flags(dc_data.flags), bc->data_fd, eblob_get_index_fd(bc));
+					eblob_dump_id(dc->key.id), eblob_dump_dctl_flags(dc_data.flags), bc->data_ctl.fd, bc->index_ctl.fd);
 			dc->flags |= BLOB_DISK_CTL_REMOVE;
-			err = __eblob_write_ll(eblob_get_index_fd(bc), dc,
+			err = __eblob_write_ll(bc->index_ctl.fd, dc,
 					sizeof(struct eblob_disk_control), loc->index_offset);
 			if (err)
 				goto err_out_exit;
+		}
+	}
+
+	if ((ctl->flags & EBLOB_ITERATE_FLAGS_VERIFY_CHECKSUM) &&
+	    !(dc->flags & BLOB_DISK_CTL_REMOVE) &&
+	    !(dc->flags & BLOB_DISK_CTL_UNCOMMITTED)) {
+		struct eblob_write_control wc;
+		memset(&wc, 0, sizeof(wc));
+		eblob_rctl_to_wc(&rc, &wc);
+		eblob_dc_to_wc(dc, &wc);
+
+		err = eblob_verify_checksum(bc->back, &dc->key, &wc);
+		if (err) {
+			eblob_dump_wc(bc->back, &dc->key, &wc, "eblob_check_disk_one: checksum verification failed", err);
+			/*
+			 * Checksum verification failed - skip the key and continue iteration.
+			 * Set err to 0 to avoid breaking the iteration.
+			 */
+			err = 0;
+			goto err_out_exit;
 		}
 	}
 
@@ -513,17 +642,23 @@ static int eblob_check_disk_one(struct eblob_iterate_local *loc)
 
 	if ((ctl->flags & EBLOB_ITERATE_FLAGS_INITIAL_LOAD)
 			&& (dc->flags & BLOB_DISK_CTL_REMOVE)) {
+		/* size of the place occupied by the record in the index and the blob */
+		const int64_t record_size = dc->disk_size + sizeof(struct eblob_disk_control);
+
 		eblob_stat_inc(bc->stat, EBLOB_LST_RECORDS_REMOVED);
-		eblob_stat_add(bc->stat, EBLOB_LST_REMOVED_SIZE, dc->disk_size);
+		eblob_stat_add(bc->stat, EBLOB_LST_REMOVED_SIZE, record_size);
+
+		eblob_stat_inc(ctl->b->stat_summary, EBLOB_LST_RECORDS_REMOVED);
+		eblob_stat_add(ctl->b->stat_summary, EBLOB_LST_REMOVED_SIZE, record_size);
 	}
 
 	if ((dc->flags & BLOB_DISK_CTL_REMOVE) ||
-			((bc->sort.fd >= 0) && !(ctl->flags & EBLOB_ITERATE_FLAGS_ALL))) {
+			(bc->index_ctl.sorted && !(ctl->flags & EBLOB_ITERATE_FLAGS_ALL))) {
 		err = 0;
 		goto err_out_exit;
 	}
 
-	err = ctl->iterator_cb.iterator(dc, &rc, bc->data_fd, dc->position + sizeof(struct eblob_disk_control),
+	err = ctl->iterator_cb.iterator(dc, &rc, bc->data_ctl.fd, dc->position + sizeof(struct eblob_disk_control),
 			ctl->priv, iter_priv->thread_priv);
 
 err_out_exit:
@@ -562,7 +697,7 @@ static int eblob_fill_range_offsets(struct eblob_base_ctl *bctl, struct eblob_it
 	 * Let's find those index blocks.
 	 */
 
-	if (bctl->sort.fd < 0)
+	if (!bctl->index_ctl.sorted)
 		return -1;
 
 	if (ctl->range_num == 0)
@@ -618,9 +753,9 @@ static int eblob_fill_range_offsets(struct eblob_base_ctl *bctl, struct eblob_it
 			range->end_offset = t->end_offset;
 		}
 
-		eblob_log(ctl->log, EBLOB_LOG_NOTICE, "iterator-range: blob: index: %d, data-fd: %d, index-fd: %d, data-size: %llu, index-size: %llu, "
-				"keys: %s..%s, index offsets: %llu..%llu\n",
-				bctl->index, bctl->data_fd, bctl->index_fd, (unsigned long long)bctl->data_size, (unsigned long long)bctl->index_size,
+		eblob_log(ctl->log, EBLOB_LOG_NOTICE, "iterator-range: blob: index: %d, data-fd: %d, index-fd: %d, data-size: %" PRIu64
+				", index-size: %" PRIu64 ", keys: %s..%s, index offsets: %llu..%llu\n",
+				bctl->index, bctl->data_ctl.fd, bctl->index_ctl.fd, bctl->data_ctl.size, bctl->index_ctl.size,
 				eblob_dump_id_len_raw(range->start_key.id, EBLOB_ID_SIZE, start_key_str),
 				eblob_dump_id_len_raw(range->end_key.id, EBLOB_ID_SIZE, end_key_str),
 				(unsigned long long)range->start_offset,
@@ -716,7 +851,6 @@ static int eblob_blob_iterator(struct eblob_iterate_priv *iter_priv)
 	 * TODO: We should probably use unsorted index because order of records
 	 * in it is identical to order of records in data blob.
 	 */
-	int index_fd = eblob_get_index_fd(bctl);
 	static const int hdr_size = sizeof(struct eblob_disk_control);
 
 	memset(&loc, 0, sizeof(loc));
@@ -782,7 +916,7 @@ static int eblob_blob_iterator(struct eblob_iterate_priv *iter_priv)
 
 		/* Wait until all pending writes are finished and lock */
 		pthread_mutex_lock(&bctl->lock);
-		err = __eblob_read_ll(index_fd, dc, batch_size * hdr_size, ctl->index_offset);
+		err = __eblob_read_ll(bctl->index_ctl.fd, dc, batch_size * hdr_size, ctl->index_offset);
 		if (err) {
 			pthread_mutex_unlock(&bctl->lock);
 			goto err_out_check;
@@ -827,9 +961,9 @@ static int eblob_blob_iterator(struct eblob_iterate_priv *iter_priv)
 
 err_out_check:
 
-	eblob_log(ctl->log, EBLOB_LOG_INFO, "blob-0.%d: iterated: data_fd: %d, index_fd: %d, "
-			"data_size: %llu, index_offset: %llu\n",
-			bctl->index, bctl->data_fd, index_fd, ctl->data_size, ctl->index_offset);
+	eblob_log(ctl->log, err < 0 ? EBLOB_LOG_ERROR : EBLOB_LOG_INFO, "blob-0.%d: iterated: data_fd: %d, index_fd: %d, "
+			"data_size: %llu, index_offset: %llu, err: %d\n",
+			bctl->index, bctl->data_ctl.fd, bctl->index_ctl.fd, ctl->data_size, ctl->index_offset, err);
 
 	/*
 	 * On open we are trying to auto-fix broken blobs by truncating them to
@@ -840,8 +974,8 @@ err_out_check:
 	if (!(ctl->flags & EBLOB_ITERATE_FLAGS_ALL)) {
 		pthread_mutex_lock(&bctl->lock);
 
-		bctl->data_offset = bctl->data_size;
-		bctl->index_size = ctl->index_offset;
+		bctl->data_ctl.offset = bctl->data_ctl.size;
+		bctl->index_ctl.size = ctl->index_offset;
 
 		/* If we have only internal error */
 		if (err && !ctl->err) {
@@ -858,28 +992,28 @@ err_out_check:
 				ctl->index_offset = loc.last_valid_offset;
 				eblob_convert_disk_control(&idc);
 
-				err = __eblob_read_ll(bctl->data_fd, &data_dc, hdr_size, idc.position);
+				err = __eblob_read_ll(bctl->data_ctl.fd, &data_dc, hdr_size, idc.position);
 				if (err) {
 					memset(&data_dc, 0, hdr_size);
 					eblob_log(ctl->log, EBLOB_LOG_ERROR,
-							"blob: read failed: fd: %d, err: %d\n", bctl->data_fd, -err);
+							"blob: read failed: fd: %d, err: %d\n", bctl->data_ctl.fd, -err);
 					ctl->err = err;
 				}
 				eblob_convert_disk_control(&data_dc);
 
-				bctl->data_offset = idc.position + data_dc.disk_size;
+				bctl->data_ctl.offset = idc.position + data_dc.disk_size;
 
 				eblob_log(ctl->log, EBLOB_LOG_ERROR, "blob: i%d: truncating eblob to: data_fd: %d, index_fd: %d, "
 						"data_size(was): %llu, data_offset: %" PRIu64 ", "
 						"data_position: %" PRIu64 ", disk_size: %" PRIu64 ", index_offset: %llu\n",
-						bctl->index, bctl->data_fd, index_fd, ctl->data_size,
-						bctl->data_offset, idc.position, idc.disk_size,
+						bctl->index, bctl->data_ctl.fd, bctl->index_ctl.fd, ctl->data_size,
+						bctl->data_ctl.offset, idc.position, idc.disk_size,
 						ctl->index_offset);
 
-				err = ftruncate(index_fd, ctl->index_offset);
+				err = ftruncate(bctl->index_ctl.fd, ctl->index_offset);
 				if (err == -1) {
 					eblob_log(ctl->log, EBLOB_LOG_ERROR,
-							"blob: truncation failed: fd: %d, err: %d\n", index_fd, -errno);
+							"blob: truncation failed: fd: %d, err: %d\n", bctl->index_ctl.fd, -errno);
 					ctl->err = -errno;
 				}
 			}
@@ -924,8 +1058,8 @@ int eblob_blob_iterate(struct eblob_iterate_control *ctl)
 	}
 
 	ctl->index_offset = 0;
-	ctl->data_size = ctl->base->data_size;
-	ctl->index_size = ctl->base->index_size;
+	ctl->data_size = ctl->base->data_ctl.size;
+	ctl->index_size = ctl->base->index_ctl.size;
 	pthread_mutex_unlock(&ctl->base->lock);
 
 	iter_priv.ctl = ctl;
@@ -970,32 +1104,6 @@ int eblob_mark_index_removed(int fd, uint64_t offset)
 }
 
 /**
- * eblob_dump_wc_raw() - pretty-print write control structure
- */
-static void eblob_dump_wc_raw(struct eblob_backend *b, int log_level, struct eblob_key *key, struct eblob_write_control *wc, const char *str, int err) {
-	eblob_log(b->cfg.log, log_level, "blob: %s: i%d: %s: position: %" PRIu64 ", "
-			"offset: %" PRIu64 ", size: %" PRIu64 ", flags: %s, "
-			"total data size: %" PRIu64 ", disk-size: %" PRIu64 ", "
-			"data_fd: %d, index_fd: %d, bctl: %p: %d\n",
-			eblob_dump_id(key->id), wc->index, str, wc->ctl_data_offset,
-			wc->offset, wc->size, eblob_dump_dctl_flags(wc->flags), wc->total_data_size, wc->total_size,
-			wc->data_fd, wc->index_fd, wc->bctl, err);
-}
-
-/**
- * eblob_dump_wc() - pretty-print write control structure with smart logging level selection
- */
-static void eblob_dump_wc(struct eblob_backend *b, struct eblob_key *key, struct eblob_write_control *wc, const char *str, int err)
-{
-	int log_level = EBLOB_LOG_NOTICE;
-
-	if (err < 0)
-		log_level = EBLOB_LOG_ERROR;
-
-	eblob_dump_wc_raw(b, log_level, key, wc, str, err);
-}
-
-/**
  * eblob_mark_entry_removed() - Mark entry as removed in both index and data file.
  *
  * Also updates stats and syncs data.
@@ -1008,6 +1116,8 @@ static int eblob_mark_entry_removed(struct eblob_backend *b,
 		struct eblob_key *key, struct eblob_ram_control *old)
 {
 	int err;
+	struct eblob_disk_control old_dc;
+	int64_t record_size = 0;
 
 	/* Add entry to list of removed entries */
 	if (eblob_binlog_enabled(&old->bctl->binlog)) {
@@ -1033,31 +1143,53 @@ static int eblob_mark_entry_removed(struct eblob_backend *b,
 
 	EBLOB_WARNX(b->cfg.log, EBLOB_LOG_NOTICE, "%s: index position: %" PRIu64 ", index_fd: %d, "
 			"data position: %" PRIu64 ", data_fd: %d",
-			eblob_dump_id(key->id), old->index_offset, eblob_get_index_fd(old->bctl),
-			old->data_offset, old->bctl->data_fd);
+			eblob_dump_id(key->id), old->index_offset, old->bctl->index_ctl.fd,
+			old->data_offset, old->bctl->data_ctl.fd);
 
-	err = eblob_mark_index_removed(eblob_get_index_fd(old->bctl), old->index_offset);
-	if (err != 0) {
-		EBLOB_WARNX(b->cfg.log, EBLOB_LOG_ERROR,
-				"%s: eblob_mark_index_removed: FAILED: index, fd: %d, err: %d",
-				eblob_dump_id(key->id), old->bctl->index_fd, err);
+	err = __eblob_read_ll(old->bctl->index_ctl.fd, &old_dc, sizeof(old_dc), old->index_offset);
+	if (err) {
+		EBLOB_WARNX(b->cfg.log, EBLOB_LOG_ERROR, "%s: __eblob_read_ll: FAILED: index, fd: %d, err: %d",
+				eblob_dump_id(key->id), old->bctl->index_ctl.fd, err);
 		goto err;
 	}
 
-	err = eblob_mark_index_removed(old->bctl->data_fd, old->data_offset);
+	/* Sanity: Check that on-disk and in-memory keys are the same */
+	if (memcmp(&old_dc.key, key, sizeof(key)) != 0) {
+		EBLOB_WARNX(b->cfg.log, EBLOB_LOG_ERROR, "keys mismatch: in-memory: %s, on-disk: %s",
+				eblob_dump_id_len(key->id, EBLOB_ID_SIZE),
+				eblob_dump_id_len(old_dc.key.id, EBLOB_ID_SIZE));
+		err = -EINVAL;
+		goto err;
+	}
+
+	eblob_convert_disk_control(&old_dc);
+	/* size of the place occupied by the record in the index and the blob */
+	record_size = old_dc.disk_size + sizeof(struct eblob_disk_control);
+
+	err = eblob_mark_index_removed(old->bctl->index_ctl.fd, old->index_offset);
+	if (err != 0) {
+		EBLOB_WARNX(b->cfg.log, EBLOB_LOG_ERROR,
+				"%s: eblob_mark_index_removed: FAILED: index, fd: %d, err: %d",
+				eblob_dump_id(key->id), old->bctl->index_ctl.fd, err);
+		goto err;
+	}
+
+	err = eblob_mark_index_removed(old->bctl->data_ctl.fd, old->data_offset);
 	if (err != 0) {
 		EBLOB_WARNX(b->cfg.log, EBLOB_LOG_ERROR,
 				"%s: eblob_mark_index_removed: FAILED: data, fd: %d, err: %d",
-				eblob_dump_id(key->id), old->bctl->data_fd, err);
+				eblob_dump_id(key->id), old->bctl->data_ctl.fd, err);
 		goto err;
 	}
 
 	eblob_stat_inc(old->bctl->stat, EBLOB_LST_RECORDS_REMOVED);
-	eblob_stat_add(old->bctl->stat, EBLOB_LST_REMOVED_SIZE, old->size);
+	eblob_stat_add(old->bctl->stat, EBLOB_LST_REMOVED_SIZE, record_size);
+	eblob_stat_inc(b->stat_summary, EBLOB_LST_RECORDS_REMOVED);
+	eblob_stat_add(b->stat_summary, EBLOB_LST_REMOVED_SIZE, record_size);
 
 	if (!b->cfg.sync) {
-		eblob_fdatasync(old->bctl->data_fd);
-		eblob_fdatasync(eblob_get_index_fd(old->bctl));
+		eblob_fdatasync(old->bctl->data_ctl.fd);
+		eblob_fdatasync(old->bctl->index_ctl.fd);
 	}
 
 err:
@@ -1262,7 +1394,7 @@ static int eblob_commit_ram(struct eblob_backend *b, struct eblob_key *key, stru
 	if (err) {
 		eblob_log(b->cfg.log, EBLOB_LOG_ERROR,
 				"blob: %s: %s: eblob_cache_insert: fd: %d: FAILED: %d.\n",
-				eblob_dump_id(key->id), __func__, eblob_get_index_fd(ctl.bctl), err);
+				eblob_dump_id(key->id), __func__, ctl.bctl->index_ctl.fd, err);
 		goto err_out_exit;
 	}
 
@@ -1446,6 +1578,7 @@ static void eblob_write_control_cleanup(struct eblob_write_control *wc) {
  *
  * NB! If this function succeeded, then @wc must be released using
  *  eblob_write_control_cleanup().
+ *  This function should only be called when @b->lock is locked by caller thread.
  */
 static int eblob_fill_write_control_from_ram(struct eblob_backend *b, struct eblob_key *key,
 		struct eblob_write_control *wc, int for_write, struct eblob_ram_control *old)
@@ -1453,7 +1586,7 @@ static int eblob_fill_write_control_from_ram(struct eblob_backend *b, struct ebl
 	FORMATTED(HANDY_TIMER_SCOPE, ("eblob.%u.lookup", b->cfg.stat_id));
 
 	struct eblob_ram_control ctl;
-	struct eblob_disk_control dc;
+	struct eblob_disk_control dc, data_dc;
 	uint64_t orig_offset = wc->offset;
 	uint64_t calculated_size;
 	int err;
@@ -1476,16 +1609,7 @@ static int eblob_fill_write_control_from_ram(struct eblob_backend *b, struct ebl
 		wc->offset = orig_offset + ctl.size;
 	}
 
-	wc->data_fd = ctl.bctl->data_fd;
-	wc->index_fd = eblob_get_index_fd(ctl.bctl);
-
-	wc->index = ctl.bctl->index;
-
-	wc->ctl_index_offset = ctl.index_offset;
-	wc->ctl_data_offset = ctl.data_offset;
-
-	wc->data_offset = wc->ctl_data_offset + sizeof(struct eblob_disk_control) + wc->offset;
-	wc->bctl = ctl.bctl;
+	eblob_rctl_to_wc(&ctl, wc);
 
 	eblob_bctl_hold(wc->bctl);
 
@@ -1494,17 +1618,24 @@ static int eblob_fill_write_control_from_ram(struct eblob_backend *b, struct ebl
 		eblob_dump_wc(b, key, wc, "eblob_fill_write_control_from_ram: ERROR-pread-index", err);
 		goto err_out_cleanup_wc;
 	}
+
+	err = __eblob_read_ll(wc->data_fd, &data_dc, sizeof(data_dc), ctl.data_offset);
+	if (err) {
+		eblob_dump_wc(b, key, wc, "eblob_fill_write_control_from_ram: ERROR-pread-data", err);
+		goto err_out_cleanup_wc;
+	}
+
 	eblob_convert_disk_control(&dc);
+	eblob_convert_disk_control(&data_dc);
+	eblob_dc_to_wc(&dc, wc);
 
-	wc->flags = dc.flags;
-	wc->total_size = dc.disk_size;
-	if (dc.data_size < wc->offset + wc->size)
-		wc->total_data_size = wc->offset + wc->size;
-	else
-		wc->total_data_size = dc.data_size;
-
-	if (!wc->size)
-		wc->size = dc.data_size;
+	/* mark entry removed if its headers from index and data are different */
+	if (eblob_index_data_mismatch(wc->bctl, &dc, &data_dc)) {
+		err = -EINVAL;
+		eblob_dump_wc(b, key, wc, "eblob_fill_write_control_from_ram: index and data headers mismatch", err);
+		// eblob_mark_entry_removed(b, key, &ctl);
+		goto err_out_cleanup_wc;
+	}
 
 	calculated_size = eblob_calculate_size(b, key, wc->offset, wc->size);
 	if (for_write && (dc.disk_size < calculated_size)) {
@@ -1592,13 +1723,13 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 	}
 
 	ctl = list_last_entry(&b->bases, struct eblob_base_ctl, base_entry);
-	if ((ctl->data_offset >= (off_t)b->cfg.blob_size) || (ctl->sort.fd >= 0) ||
-			(ctl->index_size / sizeof(struct eblob_disk_control) >= b->cfg.records_in_blob)) {
+	if ((ctl->data_ctl.offset >= b->cfg.blob_size) || ctl->index_ctl.sorted ||
+			(ctl->index_ctl.size / sizeof(struct eblob_disk_control) >= b->cfg.records_in_blob)) {
 		err = eblob_add_new_base(b);
 		if (err)
 			goto err_out_exit;
 
-		if (ctl->sort.fd < 0)
+		if (!ctl->index_ctl.sorted)
 			datasort_force_sort(b);
 
 		ctl = list_last_entry(&b->bases, struct eblob_base_ctl, base_entry);
@@ -1606,7 +1737,7 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 
 	if (old != NULL) {
 		/* Check that bctl is still valid */
-		if (old->bctl->index_fd == -1) {
+		if (old->bctl->index_ctl.fd == -1) {
 			err = -EAGAIN;
 			goto err_out_exit;
 		}
@@ -1630,14 +1761,14 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 
 	assert(datasort_base_is_sorted(ctl) != 1);
 
-	wc->data_fd = ctl->data_fd;
-	wc->index_fd = ctl->index_fd;
+	wc->data_fd = ctl->data_ctl.fd;
+	wc->index_fd = ctl->index_ctl.fd;
 
 	wc->index = ctl->index;
 	wc->on_disk = 0;
 
-	wc->ctl_index_offset = ctl->index_size;
-	wc->ctl_data_offset = ctl->data_offset;
+	wc->ctl_index_offset = ctl->index_ctl.size;
+	wc->ctl_data_offset = ctl->data_ctl.offset;
 
 	wc->data_offset = wc->ctl_data_offset + sizeof(struct eblob_disk_control) + wc->offset;
 	wc->total_data_size = wc->offset + wc->size;
@@ -1660,8 +1791,8 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 	if (wc->flags & BLOB_DISK_CTL_APPEND)
 		wc->total_size *= 2;
 
-	ctl->data_offset += wc->total_size;
-	ctl->index_size += sizeof(struct eblob_disk_control);
+	ctl->data_ctl.offset += wc->total_size;
+	ctl->index_ctl.size += sizeof(struct eblob_disk_control);
 
 	/*
 	 * We are doing early index update to prevent situations when system
@@ -1728,7 +1859,7 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 		 * We must get disk_size of old record because record could be
 		 * modified with eblob_plain_write() and not yet be committed.
 		 */
-		err = __eblob_read_ll(old->bctl->data_fd, &old_dc,
+		err = __eblob_read_ll(old->bctl->data_ctl.fd, &old_dc,
 				sizeof(struct eblob_disk_control), old->data_offset);
 		if (err) {
 			eblob_dump_wc(b, key, wc, "copy: ERROR-pread-data", err);
@@ -1747,10 +1878,10 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 		eblob_convert_disk_control(&old_dc);
 		size = old_dc.disk_size - sizeof(struct eblob_disk_control);
 
-		if (wc->data_fd != old->bctl->data_fd)
-			err = eblob_splice_data(old->bctl->data_fd, off_in, wc->data_fd, off_out, size);
+		if (wc->data_fd != old->bctl->data_ctl.fd)
+			err = eblob_splice_data(old->bctl->data_ctl.fd, off_in, wc->data_fd, off_out, size);
 		else
-			err = eblob_copy_data(old->bctl->data_fd, off_in, wc->data_fd, off_out, size);
+			err = eblob_copy_data(old->bctl->data_ctl.fd, off_in, wc->data_fd, off_out, size);
 
 		FORMATTED(HANDY_GAUGE_SET, ("eblob.%u.disk.write.move.size", b->cfg.stat_id), size);
 
@@ -1761,7 +1892,7 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 				"copy: %s: src offset: %" PRIu64 ", dst offset: %" PRIu64
 				", size: %" PRIu64 ", src fd: %d: dst fd: %d: %zd",
 				eblob_dump_id(key->id), off_in, off_out,
-				size, old->bctl->data_fd, wc->data_fd, err);
+				size, old->bctl->data_ctl.fd, wc->data_fd, err);
 		if (err < 0)
 			goto err_out_rollback;
 	}
@@ -1781,19 +1912,21 @@ static int eblob_write_prepare_disk_ll(struct eblob_backend *b, struct eblob_key
 		}
 	}
 
+	eblob_stat_inc(ctl->stat, EBLOB_LST_RECORDS_TOTAL);
 	eblob_stat_add(ctl->stat, EBLOB_LST_BASE_SIZE,
 			wc->total_size + sizeof(struct eblob_disk_control));
+
 	eblob_stat_add(b->stat_summary, EBLOB_LST_BASE_SIZE,
 	               wc->total_size + sizeof(struct eblob_disk_control));
-	eblob_stat_inc(ctl->stat, EBLOB_LST_RECORDS_TOTAL);
+	eblob_stat_inc(b->stat_summary, EBLOB_LST_RECORDS_TOTAL);
 
 	eblob_dump_wc(b, key, wc, "eblob_write_prepare_disk_ll: complete", 0);
 
 	return 0;
 
 err_out_rollback:
-	ctl->data_offset -= wc->total_size;
-	ctl->index_size -= sizeof(struct eblob_disk_control);
+	ctl->data_ctl.offset -= wc->total_size;
+	ctl->index_ctl.size -= sizeof(struct eblob_disk_control);
 err_out_exit:
 	eblob_dump_wc(b, key, wc, "eblob_write_prepare_disk_ll: error", err);
 	return err;
@@ -1885,13 +2018,42 @@ int eblob_write_prepare(struct eblob_backend *b, struct eblob_key *key,
 	if (err && err != -ENOENT && err != -E2BIG)
 		goto err_out_exit;
 
-	/* Skip preparing if key was found and it can be reused */
 	if (err == 0 && (wc.total_size >= eblob_calculate_size(b, key, 0, size))) {
+		uint64_t new_flags;
+
+		/*
+		 * We've found a key which will be overwritten,
+		 * make sure it has valid flags.
+		 *
+		 * We overwrite flags to what user has provided
+		 * dropping all existing on-disk flags since
+		 * given key will be fully overwritten and
+		 * we do not care about its old content anymore.
+		 *
+		 * The same logic is performed in @eblob_write_prepare_disk(),
+		 * but it also allocates new space.
+		 */
+		new_flags = eblob_validate_ctl_flags(b, flags);
+		new_flags |= BLOB_DISK_CTL_UNCOMMITTED;
+
+		if (wc.flags != new_flags) {
+			wc.flags = new_flags;
+
+			err = eblob_commit_disk(b, key, &wc, 0);
+			if (err)
+				goto err_out_cleanup_wc;
+
+			err = eblob_commit_ram(b, key, &wc);
+			if (err)
+				goto err_out_cleanup_wc;
+		}
+
 		eblob_stat_inc(b->stat, EBLOB_GST_PREPARE_REUSED);
 		goto err_out_cleanup_wc;
 	} else {
 		wc.flags = eblob_validate_ctl_flags(b, flags);
 		wc.flags |= BLOB_DISK_CTL_UNCOMMITTED;
+
 		err = eblob_write_prepare_disk(b, key, &wc, size, EBLOB_COPY_RECORD, 0, err == -ENOENT ? NULL : &old, defrag_generation);
 		if (err)
 			goto err_out_cleanup_wc;
@@ -1959,11 +2121,26 @@ static int eblob_write_commit_prepare(struct eblob_backend *b, struct eblob_key 
 	if (err < 0)
 		goto err_out_unlock;
 
+	/*
+	 * write commit is allowed only for uncommitted records
+	 */
+	if (!(wc->flags & BLOB_DISK_CTL_UNCOMMITTED)) {
+		err = -EPERM;
+		goto err_out_cleanup_wc;
+	}
+
 	/* Sanity - we can't commit more than we've written */
 	if (size > wc->total_size) {
 		err = -ERANGE;
 		goto err_out_cleanup_wc;
 	}
+
+	if (size != ~0ULL)
+		wc->size = wc->total_data_size = size;
+	if (flags != ~0ULL)
+		wc->flags = flags;
+
+	wc->flags = eblob_validate_ctl_flags(b, wc->flags);
 
 	/*
 	 * We can only overwrite keys inplace if data-sort is not processing
@@ -1984,12 +2161,14 @@ static int eblob_write_commit_prepare(struct eblob_backend *b, struct eblob_key 
 
 	pthread_mutex_unlock(&b->lock);
 
-	if (size != ~0ULL)
-		wc->size = wc->total_data_size = size;
-	if (flags != ~0ULL)
-		wc->flags = flags;
-
-	wc->flags = eblob_validate_ctl_flags(b, wc->flags);
+	/*
+	 * We are committing the record,
+	 * so `BLOB_DISK_CTL_UNCOMMITTED` should be removed from record's flags.
+	 * This flag is removed after a possible call of `eblob_write_prepare_disk_ll`
+	 * because `eblob_write_prepare_disk_ll` copies data from locked blob to open one
+	 * and it should be copied with original flags.
+	 */
+	wc->flags &= ~BLOB_DISK_CTL_UNCOMMITTED;
 
 	return err;
 
@@ -2133,6 +2312,14 @@ static int eblob_plain_writev_prepare(struct eblob_backend *b, struct eblob_key 
 		goto err_out_unlock;
 
 	/*
+	 * plain write is allowed only for uncommitted records
+	 */
+	if (!(wc->flags & BLOB_DISK_CTL_UNCOMMITTED)) {
+		err = -EPERM;
+		goto err_out_cleanup_wc;
+	}
+
+	/*
 	 * We can't use plain write if EXTHDR flag is differ on old and new record.
 	 * TODO: We can preform read-modify-write cycle here but it's too hacky.
 	 */
@@ -2141,6 +2328,8 @@ static int eblob_plain_writev_prepare(struct eblob_backend *b, struct eblob_key 
 		err = -ENOTSUP;
 		goto err_out_cleanup_wc;
 	}
+
+	wc->flags = eblob_validate_ctl_flags(b, flags) | BLOB_DISK_CTL_UNCOMMITTED;
 
 	/*
 	 * We can only overwrite keys inplace if data-sort is not processing
@@ -2153,9 +2342,24 @@ static int eblob_plain_writev_prepare(struct eblob_backend *b, struct eblob_key 
 		if (err != 0)
 			goto err_out_cleanup_wc;
 
-		/* FIXME: We are possibly oversubscribing size here */
+		/*
+		 * Copy prepare_disk_size bytes of an existing key from old closed blob to a new one.
+		 * prepare_disk_size is calculated as follows: wc->total_size decreased by the size of the header and footer -
+		 * that's because eblob_write_prepare_disk_ll() accepts size of the space allocated for data,
+		 * and it will add header and footer sizes internally.
+		 */
+		const uint64_t hdr_footer_size = sizeof(struct eblob_disk_control) + eblob_get_footer_size(b, wc);
+		if (wc->total_size < hdr_footer_size) {
+			err = -EINVAL;
+			eblob_log(b->cfg.log, EBLOB_LOG_NOTICE,
+				  "blob i%d: %s: %s: size check failed: total-size: %" PRIu64 ", header-footer-size: %" PRIu64 "\n",
+				  wc->index, eblob_dump_id(key->id), __func__, wc->total_size, hdr_footer_size);
+			eblob_dump_wc(b, key, wc, "eblob_plain_writev_prepare: ERROR-size-check", err);
+			goto err_out_cleanup_wc;
+		}
+		const uint64_t prepare_disk_size = wc->total_size - hdr_footer_size;
 		err = eblob_write_prepare_disk_ll(b, key, wc,
-				wc->total_data_size + bounds.max,
+				prepare_disk_size,
 				EBLOB_COPY_RECORD, 0, &rctl);
 		if (err != 0)
 			goto err_out_cleanup_wc;
@@ -2163,8 +2367,6 @@ static int eblob_plain_writev_prepare(struct eblob_backend *b, struct eblob_key 
 	}
 
 	pthread_mutex_unlock(&b->lock);
-
-	wc->flags = eblob_validate_ctl_flags(b, flags);
 
 	return err;
 
@@ -2386,18 +2588,24 @@ int eblob_remove(struct eblob_backend *b, struct eblob_key *key)
 	struct eblob_ram_control ctl;
 	int err, disk;
 
+
+	pthread_mutex_lock(&b->lock);
 	err = eblob_cache_lookup(b, key, &ctl, &disk);
 	if (err) {
+		pthread_mutex_unlock(&b->lock);
 		eblob_log(b->cfg.log, EBLOB_LOG_ERROR, "blob: %s: %s: eblob_cache_lookup: %d.\n",
 				eblob_dump_id(key->id), __func__, err);
 		goto err_out_exit;
 	}
 
+	eblob_bctl_hold(ctl.bctl);
+	pthread_mutex_unlock(&b->lock);
+
 	if ((err = eblob_mark_entry_removed_purge(b, key, &ctl)) != 0) {
 		eblob_log(b->cfg.log, EBLOB_LOG_ERROR,
 				"%s: %s: eblob_mark_entry_removed_purge: %d\n",
 				__func__, eblob_dump_id(key->id), -err);
-		goto err_out_exit;
+		goto err_out_bctl_release;
 	}
 
 	eblob_log(b->cfg.log, EBLOB_LOG_NOTICE,
@@ -2405,6 +2613,8 @@ int eblob_remove(struct eblob_backend *b, struct eblob_key *key)
 		", size: %" PRIu64 ".\n",
 		eblob_dump_id(key->id), ctl.data_offset, ctl.size);
 
+err_out_bctl_release:
+	eblob_bctl_release(ctl.bctl);
 err_out_exit:
 	if (err && err != -ENOENT) {
 		FORMATTED(HANDY_COUNTER_INCREMENT, ("eblob.%u.disk.remove.errors.%d", b->cfg.stat_id, -err), 1);
@@ -2431,7 +2641,10 @@ static int _eblob_read_ll(struct eblob_backend *b, struct eblob_key *key,
 	eblob_stat_inc(b->stat, EBLOB_GST_LOOKUP_READS_NUMBER);
 
 	memset(wc, 0, sizeof(struct eblob_write_control));
+
+	pthread_mutex_lock(&b->lock);
 	err = eblob_fill_write_control_from_ram(b, key, wc, 0, NULL);
+	pthread_mutex_unlock(&b->lock);
 	if (err < 0) {
 		eblob_log(b->cfg.log, EBLOB_LOG_ERROR,
 				"blob: %s: %s: eblob_fill_write_control_from_ram: %d.\n",
@@ -2618,8 +2831,8 @@ int eblob_sync(struct eblob_backend *b)
 	pthread_mutex_lock(&b->sync_lock);
 
 	list_for_each_entry(ctl, &b->bases, base_entry) {
-		fsync(ctl->data_fd);
-		fsync(eblob_get_index_fd(ctl));
+		fsync(ctl->data_ctl.fd);
+		fsync(ctl->index_ctl.fd);
 	}
 
 	pthread_mutex_unlock(&b->sync_lock);
@@ -2716,6 +2929,7 @@ void eblob_cleanup(struct eblob_backend *b)
 
 	free(b->base_dir);
 	free(b->cfg.file);
+	free(b->cfg.chunks_dir);
 
 	eblob_stat_destroy(b->stat);
 	eblob_stat_destroy(b->stat_summary);
@@ -2819,6 +3033,14 @@ struct eblob_backend *eblob_init(struct eblob_config *c)
 	if (!b->cfg.file) {
 		errno = -ENOMEM;
 		goto err_out_stat_free_local;
+	}
+
+	if (c->chunks_dir) {
+		b->cfg.chunks_dir = strdup(c->chunks_dir);
+		if (!b->cfg.chunks_dir) {
+			errno = -ENOMEM;
+			goto err_out_free_file;
+		}
 	}
 
 	b->base_dir = strdup(c->file);
@@ -2941,6 +3163,7 @@ err_out_free_base_dir:
 	free(b->base_dir);
 err_out_free_file:
 	free(b->cfg.file);
+	free(b->cfg.chunks_dir);
 err_out_stat_free_local:
 	eblob_stat_destroy(b->stat_summary);
 err_out_stat_free:

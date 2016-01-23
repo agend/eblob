@@ -29,19 +29,6 @@
 
 #include "measure_points.h"
 
-static const uint64_t EBLOB_CSUM_CHUNK_SIZE = 1UL<<20;
-
-/*
- * eblob_disk_footer contains csum of data.
- * @csum - sha512 of record's data.
- *
- * eblob_disk_footer are kept at the end of the recods.
- */
-struct eblob_disk_footer {
-	unsigned char	csum[EBLOB_ID_SIZE];
-	uint64_t	offset;
-} __attribute__ ((packed));
-
 /*
  * mmhash_file() - computes MurmurHash64A of bytes range read from @fd with @offset and @count.
  *
@@ -77,7 +64,7 @@ static inline int mmhash_file(int fd, off_t offset, size_t count, uint64_t &resu
  *
  * Returns footer offset within record.
  */
-static inline uint64_t chunked_footer_offset(struct eblob_write_control *wc) {
+static inline uint64_t chunked_footer_offset(const struct eblob_write_control *wc) {
 	/* size of one checksum */
 	static const size_t f_size = sizeof(uint64_t);
 	/* size of whole record without header and final checksum */
@@ -108,11 +95,20 @@ static inline uint64_t chunked_footer_offset(struct eblob_write_control *wc) {
  * @footers_offset can be used for reading and verifying on-disk checksums or for writing calculated checksums
  */
 static int eblob_chunked_mmhash(struct eblob_backend *b, struct eblob_key *key, struct eblob_write_control *wc,
-                               const uint64_t offset, const uint64_t size,
-                               std::vector<uint64_t> &checksums, uint64_t &checksums_offset) {
+                                const uint64_t offset, const uint64_t size,
+                                std::vector<uint64_t> &checksums, uint64_t &checksums_offset) {
 	int err = 0;
-	uint64_t first_chunk = offset / EBLOB_CSUM_CHUNK_SIZE;
-	uint64_t last_chunk = (offset + size - 1) / EBLOB_CSUM_CHUNK_SIZE + 1;
+	const uint64_t first_chunk = offset / EBLOB_CSUM_CHUNK_SIZE;
+
+	/* There is nothing to be checksummed if @size is 0, so set @last_chunk equal to @first_chunk
+	 * to make code below correctly clear @checksums.
+	 *
+	 * Zero @size here can be caused by only one of:
+	 * * a client tries to verify 0 bytes from the data;
+	 * * a client updates 0 bytes of the data and now eblob is calculating checksums of updated part;
+	 * in both cases checksums shouldn't be calculated because no data is touched or updated.
+	 */
+	const uint64_t last_chunk = (size == 0) ? first_chunk : ((offset + size - 1) / EBLOB_CSUM_CHUNK_SIZE + 1);
 	const uint64_t offset_max = wc->ctl_data_offset + wc->total_data_size + sizeof(struct eblob_disk_control);
 	const uint64_t data_offset = wc->ctl_data_offset + sizeof(struct eblob_disk_control);
 	checksums_offset = wc->ctl_data_offset + chunked_footer_offset(wc) + first_chunk * sizeof(uint64_t);
@@ -157,6 +153,16 @@ uint64_t eblob_calculate_footer_size(struct eblob_backend *b, uint64_t data_size
 	return footers_count * sizeof(uint64_t);
 }
 
+uint64_t eblob_get_footer_size(const struct eblob_backend *b, const struct eblob_write_control *wc) {
+	if (b->cfg.blob_flags & EBLOB_NO_FOOTER)
+		return 0;
+
+	if (wc->flags & BLOB_DISK_CTL_CHUNKED_CSUM)
+		return wc->total_size - chunked_footer_offset(wc);
+	else
+		return sizeof(struct eblob_disk_footer);
+}
+
 /*
  * eblob_verify_sha512() - verifies checksum of enty pointed by @wc by comparing sha512 of whole record's data with footer.
  *
@@ -170,8 +176,13 @@ static int eblob_verify_sha512(struct eblob_backend *b, struct eblob_key *key, s
 	static const auto hdr_size = sizeof(struct eblob_disk_control);
 
 	/* sanity check that entry has valid total_size and total_data_size */
-	if (wc->total_size < wc->total_data_size + sizeof(hdr_size) + sizeof(f))
+	if (wc->total_size < wc->total_data_size + sizeof(hdr_size) + sizeof(f)) {
+		eblob_log(b->cfg.log, EBLOB_LOG_ERROR, "blob: %i: %s: %s: record doesn't have valid footer: "
+		          "total_size: %" PRIu64 ", total_data_size + eblob_disk_control + footer: %" PRIu64,
+		          wc->index, eblob_dump_id(key->id), __func__,
+		          wc->total_size, wc->total_data_size + sizeof(hdr_size) + sizeof(f));
 		return -EINVAL;
+	}
 
 	err = __eblob_read_ll(wc->data_fd, &f, sizeof(f), off);
 	if (err) {
@@ -192,9 +203,10 @@ static int eblob_verify_sha512(struct eblob_backend *b, struct eblob_key *key, s
 	}
 
 	if (memcmp(csum, f.csum, sizeof(csum))) {
+		err = -EILSEQ;
 		eblob_log(b->cfg.log, EBLOB_LOG_ERROR, "blob i%d: %s: %s: checksum mismatch: err: %d\n",
 		          wc->index, eblob_dump_id(key->id), __func__, err);
-		return -EILSEQ;
+		return err;
 	}
 
 	eblob_log(b->cfg.log, EBLOB_LOG_NOTICE, "blob: i%d: %s: %s: checksum verified\n",
@@ -214,6 +226,16 @@ static int eblob_verify_mmhash(struct eblob_backend *b, struct eblob_key *key, s
 	int err = 0;
 	uint64_t footers_offset = 0,
 	         footers_size = 0;
+
+	/* sanity check that footers are located after data */
+	const auto footer_offset = chunked_footer_offset(wc);
+	if (footer_offset < wc->total_data_size + sizeof(struct eblob_disk_control)) {
+		eblob_log(b->cfg.log, EBLOB_LOG_ERROR, "blob: %i: %s: %s: record doesn't have valid footer: "
+		          "footer_offset: %" PRIu64 ", total_data_size + eblob_disk_control: %" PRIu64,
+		          wc->index, eblob_dump_id(key->id), __func__,
+		          footer_offset, wc->total_data_size + sizeof(struct eblob_disk_control));
+		return -EINVAL;
+	}
 
 	std::vector<uint64_t> calc_footers, check_footers;
 
@@ -254,8 +276,13 @@ int eblob_verify_checksum(struct eblob_backend *b, struct eblob_key *key, struct
 	    wc->flags & BLOB_DISK_CTL_NOCSUM)
 		return 0;
 
-	if (wc->total_size <= wc->total_data_size + sizeof(struct eblob_disk_control))
+	if (wc->total_size <= wc->total_data_size + sizeof(struct eblob_disk_control)) {
+		eblob_log(b->cfg.log, EBLOB_LOG_ERROR, "blob: %i: %s: %s: record doesn't have valid footer: "
+		          "total_size: %" PRIu64 ", total_data_size + eblob_disk_control: %" PRIu64,
+		          wc->index, eblob_dump_id(key->id), __func__,
+		          wc->total_size, wc->total_data_size + sizeof(struct eblob_disk_control));
 		return -EINVAL;
+	}
 
 	FORMATTED(HANDY_TIMER_SCOPE, ("eblob.%u.verify_checksum", b->cfg.stat_id));
 
